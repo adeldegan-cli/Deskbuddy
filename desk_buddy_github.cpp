@@ -90,7 +90,7 @@ const uint16_t COL_BLUE   = 0x041F;
 
 String textColorKey = "standard";
 String unitKey = "metric"; // metric = C/mm, imperial = F/in
-String regionFormatKey = "europe"; // europe = 24h + dd.mm.yyyy, us = 12h + mm/dd/yyyy
+String regionFormatKey = "europe"; // europe = 24h + dd.mm.yyyy, us = 12h + mm/dd/yyyy, iso = 24h + yyyy-mm-dd
 String timezoneKey = "europe_central";
 
 // =========================================================
@@ -524,7 +524,10 @@ static String formatClockParts(const struct tm& tmValue, bool withSeconds) {
 
 static String formatDateParts(const struct tm& tmValue) {
   char buf[32];
-  strftime(buf, sizeof(buf), useUsRegionFormat() ? "%a %m/%d/%Y" : "%a %d.%m.%Y", &tmValue);
+  const char* pattern = "%a %d.%m.%Y";
+  if (useUsRegionFormat()) pattern = "%a %m/%d/%Y";
+  else if (regionFormatKey == "iso") pattern = "%a %Y-%m-%d";
+  strftime(buf, sizeof(buf), pattern, &tmValue);
   return String(buf);
 }
 
@@ -1017,7 +1020,7 @@ void loadStoredSettings() {
   }
 
   if (unitKey != "metric" && unitKey != "imperial") unitKey = "metric";
-  if (regionFormatKey != "europe" && regionFormatKey != "us") regionFormatKey = "europe";
+  if (regionFormatKey != "europe" && regionFormatKey != "us" && regionFormatKey != "iso") regionFormatKey = "europe";
   buddyNickname.trim();
   applyThemeByKey(accent, bg);
   applyTextColorByKey(txt);
@@ -2350,6 +2353,7 @@ void handleRoot() {
   page += "<div><label class='label'>Date format</label><select name='region'>";
   page += "<option value='europe'" + String(region=="europe"?" selected":"") + ">European: dd.mm.yyyy</option>";
   page += "<option value='us'" + String(region=="us"?" selected":"") + ">US: mm/dd/yyyy</option>";
+  page += "<option value='iso'" + String(region=="iso"?" selected":"") + ">ISO: yyyy-mm-dd</option>";
   page += "</select></div>";
   page += "<div><label class='label'>Time zone</label><select name='tz'>";
   appendTimezoneOptions(page, tz);
@@ -2455,7 +2459,7 @@ void handleSave() {
   if (newLoc.length() == 0) newLoc = "Unknown";
   if (newNickname.length() > 24) newNickname = newNickname.substring(0, 24);
   if (newUnits != "metric" && newUnits != "imperial") newUnits = "metric";
-  if (newRegion != "europe" && newRegion != "us") newRegion = "europe";
+  if (newRegion != "europe" && newRegion != "us" && newRegion != "iso") newRegion = "europe";
   newTz = sanitizeTimezoneKey(newTz);
 
   int newSleepMin = server.hasArg("sleepMin") ? server.arg("sleepMin").toInt() : sleepIntervalMin;
