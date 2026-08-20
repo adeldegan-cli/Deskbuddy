@@ -181,6 +181,26 @@ enum Page {
   PAGE_CONTROLS = 4
 };
 
+// Pages shown in the nav bar, in order. Weather and Notes are parked for
+// now — to bring one back, uncomment its entry in BOTH arrays and re-enable
+// its cases in drawCurrentPageFull/updateCurrentPageDynamic below. (Weather
+// DATA still updates regardless — the Home widgets use it.)
+const Page NAV_PAGES[] = {
+  PAGE_HOME,
+  // PAGE_WEATHER,
+  // PAGE_NOTES,
+  PAGE_STATUS,
+  PAGE_CONTROLS
+};
+const char* NAV_NAMES[] = {
+  "Home",
+  // "Weather",
+  // "Notes",
+  "Status",
+  "Ctrl"
+};
+const int NAV_COUNT = sizeof(NAV_PAGES) / sizeof(NAV_PAGES[0]);
+
 Page currentPage = PAGE_HOME;
 Page lastDrawnPage = (Page)-1;
 
@@ -1346,6 +1366,36 @@ unsigned long lastHermesPollMs = 0;
 const unsigned long NIM_POLL_MS = 10000;
 const unsigned long HERMES_POLL_MS = 5000;
 
+// All controls HTTP runs on a worker task (core 0) so the UI thread never
+// blocks on the network — button presses enqueue a command and return.
+enum CtrlCmd : uint8_t {
+  CMD_NIM_POLL,
+  CMD_NIM_PAUSE_RESUME,
+  CMD_NIM_STOP_SAVE,
+  CMD_HERMES_POLL,
+  CMD_HERMES_TOGGLE
+};
+QueueHandle_t ctrlQueue = nullptr;
+SemaphoreHandle_t ctrlMutex = nullptr;
+volatile bool ctrlBusy = false;        // worker is mid-request
+volatile bool ctrlStateDirty = false;  // worker finished; UI should redraw
+
+// Only Strings need the mutex (heap realloc during a cross-core read can
+// crash); 32-bit primitives are atomic on Xtensa.
+void ctrlLock() { if (ctrlMutex) xSemaphoreTake(ctrlMutex, portMAX_DELAY); }
+void ctrlUnlock() { if (ctrlMutex) xSemaphoreGive(ctrlMutex); }
+
+// (takes uint8_t rather than CtrlCmd so the Arduino IDE's auto-generated
+// prototype, which lands above the enum definition, still compiles)
+void enqueueCtrl(uint8_t cmd) {
+  if (!ctrlQueue) return;
+  xQueueSend(ctrlQueue, &cmd, 0);
+}
+
+bool ctrlIdle() {
+  return !ctrlBusy && ctrlQueue && uxQueueMessagesWaiting(ctrlQueue) == 0;
+}
+
 // Parse "2026-08-19T14:03:11.000Z" (UTC) to epoch. Same approach as the
 // sunrise parser: fields via sscanf, then days-since-epoch arithmetic so the
 // device timezone can't skew it.
@@ -1375,9 +1425,17 @@ long nimElapsedSeconds() {
 // filling respDoc when the response parses as JSON.
 int nimRequest(const char* method, const String& path, const String& body, JsonDocument& respDoc) {
   if (WiFi.status() != WL_CONNECTED) return -1;
-  WiFiClientSecure client;
-  client.setInsecure();
+  // Persistent client (worker task only): with setReuse the TLS session and
+  // TCP connection survive between calls, cutting each request from a full
+  // ~1-2s handshake to a single round trip while the server keeps it alive.
+  static WiFiClientSecure client;
+  static bool clientInit = false;
+  if (!clientInit) {
+    client.setInsecure();
+    clientInit = true;
+  }
   HTTPClient http;
+  http.setReuse(true);
   http.setTimeout(15000);
   if (!http.begin(client, String(NIMHUB_BASE) + path)) return -1;
   http.addHeader("Authorization", String("Bearer ") + NIMHUB_TOKEN);
@@ -1389,20 +1447,11 @@ int nimRequest(const char* method, const String& path, const String& body, JsonD
   return code;
 }
 
-bool pollNimTimer() {
-  StaticJsonDocument<1536> doc;
-  int code = nimRequest("GET", "/active-timer/my", "", doc);
-  if (code != 200) {
-    nimStateKnown = true;
-    nimError = true;
-    return false;
-  }
-  nimError = false;
-  nimStateKnown = true;
-  JsonVariant data = doc["data"];
+// Apply a timer object from any endpoint's response (poll, pause, resume).
+void applyNimTimerData(JsonVariant data) {
   if (data.isNull()) {
     nimTimerPresent = false;
-    return true;
+    return;
   }
   nimTimerPresent = true;
   nimTimerId = data["ActiveTimerID"] | 0L;
@@ -1411,8 +1460,28 @@ bool pollNimTimer() {
   nimTimerPaused = data["IsPaused"] | false;
   nimAccumSec = data["AccumulatedSeconds"] | 0L;
   nimStartEpoch = parseIsoUtcEpoch(data["StartTime"] | (const char*)nullptr);
+  ctrlLock();
   nimTimerDesc = String((const char*)(data["Description"] | ""));
+  ctrlUnlock();
+}
+
+bool pollNimTimer() {
+  StaticJsonDocument<1536> doc;
+  int code = nimRequest("GET", "/active-timer/my", "", doc);
+  nimStateKnown = true;
+  if (code != 200) {
+    nimError = true;
+    return false;
+  }
+  nimError = false;
+  applyNimTimerData(doc["data"]);
   return true;
+}
+
+void setNimActionMsg(const String& msg) {
+  ctrlLock();
+  nimActionMsg = msg;
+  ctrlUnlock();
 }
 
 void nimPauseResume() {
@@ -1421,15 +1490,20 @@ void nimPauseResume() {
   int code;
   if (nimTimerPaused) {
     code = nimRequest("POST", "/active-timer/" + String(nimTimerId) + "/resume", "", doc);
-    nimActionMsg = (code == 200) ? "Resumed" : "Resume failed";
+    setNimActionMsg((code == 200) ? "Resumed" : "Resume failed");
   } else {
     String body = String("{\"ElapsedSeconds\":") + nimElapsedSeconds() + "}";
     code = nimRequest("POST", "/active-timer/" + String(nimTimerId) + "/pause", body, doc);
-    nimActionMsg = (code == 200) ? "Paused" : "Pause failed";
+    setNimActionMsg((code == 200) ? "Paused" : "Pause failed");
   }
-  // Whatever happened, re-sync from the server (a 403/500 usually means the
-  // timer changed under us — the web UI may have stopped it).
-  pollNimTimer();
+  if (code == 200) {
+    // The action response carries the updated timer — no second round trip.
+    applyNimTimerData(doc["data"]);
+  } else {
+    // A 403/500 usually means the timer changed under us (the web UI may
+    // have stopped it) — re-sync from the server.
+    pollNimTimer();
+  }
 }
 
 void nimStopAndSave() {
@@ -1462,16 +1536,20 @@ void nimStopAndSave() {
                 ",\"description\":\"" + desc + "\"}";
   int code = nimRequest("POST", "/time-entries", body, doc);
   if (code != 200 && code != 201) {
-    nimActionMsg = "Save failed (" + String(code) + ")";
+    setNimActionMsg("Save failed (" + String(code) + ")");
     pollNimTimer();
     return;
   }
 
   StaticJsonDocument<1536> delDoc;
   int delCode = nimRequest("DELETE", "/active-timer/" + String(nimTimerId), "", delDoc);
-  nimActionMsg = (delCode == 200) ? ("Saved " + String(hoursBuf) + "h")
-                                  : "Saved; timer stuck";
-  pollNimTimer();
+  if (delCode == 200) {
+    nimTimerPresent = false;
+    setNimActionMsg("Saved " + String(hoursBuf) + "h");
+  } else {
+    setNimActionMsg("Saved; timer stuck");
+    pollNimTimer();
+  }
 }
 
 // One HTTP round trip to the Hermes Ear Jetson (plain LAN HTTP).
@@ -1523,6 +1601,25 @@ String formatHms(long totalSec) {
   return String(buf);
 }
 
+// Worker task (core 0): drains the command queue, doing all the blocking
+// network work off the UI thread. The UI enqueues and keeps drawing.
+void controlsWorkerTask(void*) {
+  uint8_t cmd;
+  for (;;) {
+    if (xQueueReceive(ctrlQueue, &cmd, portMAX_DELAY) != pdTRUE) continue;
+    ctrlBusy = true;
+    switch ((CtrlCmd)cmd) {
+      case CMD_NIM_POLL:         pollNimTimer(); break;
+      case CMD_NIM_PAUSE_RESUME: nimPauseResume(); break;
+      case CMD_NIM_STOP_SAVE:    nimStopAndSave(); break;
+      case CMD_HERMES_POLL:      pollHermes(); break;
+      case CMD_HERMES_TOGGLE:    hermesToggle(); break;
+    }
+    ctrlBusy = false;
+    ctrlStateDirty = true;
+  }
+}
+
 // =========================================================
 // DRAW HELPERS
 // =========================================================
@@ -1562,12 +1659,11 @@ void drawNavBar() {
   tft.fillRect(0, y, SCREEN_W, NAV_H, COL_PANEL_ALT);
   tft.drawFastHLine(0, y, SCREEN_W, COL_STROKE);
 
-  const int btnW = SCREEN_W / 5;
-  const char* names[5] = {"Home", "Wx", "Notes", "Status", "Ctrl"};
+  const int btnW = SCREEN_W / NAV_COUNT;
 
-  for (int i = 0; i < 5; i++) {
+  for (int i = 0; i < NAV_COUNT; i++) {
     int bx = i * btnW;
-    bool active = ((int)currentPage == i);
+    bool active = (currentPage == NAV_PAGES[i]);
 
     uint16_t bg = active ? COL_ACCENT : COL_PANEL;
     uint16_t fg = active ? TFT_BLACK : COL_TEXT;
@@ -1577,7 +1673,7 @@ void drawNavBar() {
 
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(fg, bg);
-    tft.drawString(names[i], bx + btnW / 2, y + NAV_H / 2, 1);
+    tft.drawString(NAV_NAMES[i], bx + btnW / 2, y + NAV_H / 2, 1);
   }
 
   tft.setTextDatum(TL_DATUM);
@@ -2283,6 +2379,12 @@ void drawControlsPageFull() {
 }
 
 void updateControlsDynamic() {
+  // Strings are shared with the worker task — copy them under the lock.
+  ctrlLock();
+  String descCopy = nimTimerDesc;
+  String msgCopy = nimActionMsg;
+  ctrlUnlock();
+
   // --- NIM Hub status card ---
   String nimLine1, nimLine2;
   if (!nimEnabled()) {
@@ -2292,13 +2394,14 @@ void updateControlsDynamic() {
     nimLine1 = "Checking...";
   } else if (nimError) {
     nimLine1 = "Unreachable";
-    nimLine2 = nimActionMsg;
+    nimLine2 = msgCopy;
   } else if (!nimTimerPresent) {
     nimLine1 = "No timer running";
-    nimLine2 = nimActionMsg;
+    nimLine2 = msgCopy;
   } else {
     nimLine1 = formatHms(nimElapsedSeconds()) + (nimTimerPaused ? "  paused" : "");
-    nimLine2 = nimTimerDesc.length() ? nimTimerDesc : ("Task #" + String(nimTaskId));
+    if (msgCopy == "Working...") nimLine1 = "Working...";
+    nimLine2 = descCopy.length() ? descCopy : ("Task #" + String(nimTaskId));
   }
   String nimCard = nimLine1 + "|" + nimLine2;
   if (nimCard != lastNimCardText) {
@@ -2383,10 +2486,13 @@ void updateControlsDynamic() {
 void drawCurrentPageFull() {
   switch (currentPage) {
     case PAGE_HOME:    drawHomePageFull(); break;
-    case PAGE_WEATHER: drawWeatherPageFull(); break;
-    case PAGE_NOTES:   drawNotesPageFull(); break;
+    // Weather and Notes pages parked — uncomment (and their NAV_PAGES
+    // entries) to restore:
+    // case PAGE_WEATHER: drawWeatherPageFull(); break;
+    // case PAGE_NOTES:   drawNotesPageFull(); break;
     case PAGE_STATUS:  drawStatusPageFull(); break;
     case PAGE_CONTROLS: drawControlsPageFull(); break;
+    default: drawHomePageFull(); break;
   }
 
   if (focusMenuOpen && currentPage == PAGE_HOME) drawFocusMenuOverlay(true);
@@ -2406,10 +2512,13 @@ void updateCurrentPageDynamic() {
 
   switch (currentPage) {
     case PAGE_HOME:    updateHomeDynamic(); break;
-    case PAGE_WEATHER: updateWeatherDynamic(); break;
-    case PAGE_NOTES:   updateNotesDynamic(); break;
+    // Weather and Notes pages parked — uncomment (and their NAV_PAGES
+    // entries) to restore:
+    // case PAGE_WEATHER: updateWeatherDynamic(); break;
+    // case PAGE_NOTES:   updateNotesDynamic(); break;
     case PAGE_STATUS:  updateStatusDynamic(); break;
     case PAGE_CONTROLS: updateControlsDynamic(); break;
+    default: break;
   }
 }
 
@@ -2512,27 +2621,25 @@ bool handleStatusTouch(int x, int y) {
 bool handleControlsTouch(int x, int y) {
   if (currentPage != PAGE_CONTROLS) return false;
 
-  // NIM Hub buttons (row 2): Pause/Resume left, Stop & Save right
+  // NIM Hub buttons (row 2): Pause/Resume left, Stop & Save right.
+  // Presses enqueue a command for the worker task and return immediately;
+  // presses while a request is in flight are consumed and ignored.
   bool nimActive = nimEnabled() && nimStateKnown && !nimError && nimTimerPresent;
   if (nimActive && y >= PAGE_ROW2_Y + 16 && y < PAGE_ROW2_Y + 54) {
     if (x >= 16 && x < 108) {
-      nimActionMsg = "Working...";
+      if (!ctrlIdle()) return true;
+      setNimActionMsg("Working...");
       lastNimCardText = "";
       updateControlsDynamic();
-      nimPauseResume();
-      lastNimCardText = "";
-      lastNimButtonsText = "";
-      updateControlsDynamic();
+      enqueueCtrl(CMD_NIM_PAUSE_RESUME);
       return true;
     }
     if (x >= 132 && x < 224) {
-      nimActionMsg = "Working...";
+      if (!ctrlIdle()) return true;
+      setNimActionMsg("Working...");
       lastNimCardText = "";
       updateControlsDynamic();
-      nimStopAndSave();
-      lastNimCardText = "";
-      lastNimButtonsText = "";
-      updateControlsDynamic();
+      enqueueCtrl(CMD_NIM_STOP_SAVE);
       return true;
     }
   }
@@ -2540,9 +2647,8 @@ bool handleControlsTouch(int x, int y) {
   // Hermes toggle button (row 3)
   bool hermesActive = hermesEnabled() && hermesStateKnown && !hermesError;
   if (hermesActive && x >= 156 && x < 222 && y >= PAGE_ROW3_Y + 20 && y < PAGE_ROW3_Y + 50) {
-    hermesToggle();
-    lastHermesCardText = "";
-    updateControlsDynamic();
+    if (!ctrlIdle()) return true;
+    enqueueCtrl(CMD_HERMES_TOGGLE);
     return true;
   }
 
@@ -2555,11 +2661,11 @@ bool handleControlsTouch(int x, int y) {
 void handleNavTouch(int x, int y) {
   if (y < SCREEN_H - NAV_H) return;
 
-  int btnW = SCREEN_W / 5;
+  int btnW = SCREEN_W / NAV_COUNT;
   int idx = x / btnW;
-  if (idx < 0 || idx > 4) return;
+  if (idx < 0 || idx >= NAV_COUNT) return;
 
-  Page newPage = (Page)idx;
+  Page newPage = NAV_PAGES[idx];
   if (newPage != currentPage) {
     currentPage = newPage;
     pageDirty = true;
@@ -3068,6 +3174,12 @@ void setup() {
 
   setupWebServer();
 
+  // Controls worker: all NIM Hub / Hermes HTTP happens on core 0 so the UI
+  // (core 1) never freezes on the network. 12KB stack for TLS + JSON.
+  ctrlMutex = xSemaphoreCreateMutex();
+  ctrlQueue = xQueueCreate(8, sizeof(uint8_t));
+  xTaskCreatePinnedToCore(controlsWorkerTask, "ctrlWorker", 12288, nullptr, 1, nullptr, 0);
+
   pageDirty = true;
   dataDirty = true;
   notesDirty = true;
@@ -3136,15 +3248,26 @@ void loop() {
     ensureKpIndex();
   }
 
-  // Controls page polling — only while the page is visible and awake
-  if (currentPage == PAGE_CONTROLS && !sleepOff && WiFi.status() == WL_CONNECTED) {
+  // Controls page polling — only while the page is visible and awake.
+  // Polls are enqueued for the worker task, never run on the UI thread.
+  if (currentPage == PAGE_CONTROLS && !sleepOff && WiFi.status() == WL_CONNECTED && ctrlIdle()) {
     if (nimEnabled() && millis() - lastNimPollMs >= NIM_POLL_MS) {
       lastNimPollMs = millis();
-      pollNimTimer();
-    }
-    if (hermesEnabled() && millis() - lastHermesPollMs >= HERMES_POLL_MS) {
+      enqueueCtrl(CMD_NIM_POLL);
+    } else if (hermesEnabled() && millis() - lastHermesPollMs >= HERMES_POLL_MS) {
       lastHermesPollMs = millis();
-      pollHermes();
+      enqueueCtrl(CMD_HERMES_POLL);
+    }
+  }
+
+  // Worker finished a command — refresh the Controls page with the result
+  if (ctrlStateDirty) {
+    ctrlStateDirty = false;
+    if (currentPage == PAGE_CONTROLS && !sleepOff && !pageDirty) {
+      lastNimCardText = "";
+      lastNimButtonsText = "";
+      lastHermesCardText = "";
+      updateControlsDynamic();
     }
   }
 
